@@ -89,5 +89,7 @@ jobs:
             exit 0
           fi
 
-          git merge --no-edit "origin/${UPSTREAM_HISTORY_BRANCH}"
+          # Apply upstream changes while preserving custom my-rules edits when
+          # both sides changed the same generated rule lines.
+          git merge --no-edit -X ours "origin/${UPSTREAM_HISTORY_BRANCH}"
           git push origin "HEAD:${TARGET_BRANCH}"
