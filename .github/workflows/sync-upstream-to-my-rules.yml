@@ -1,6 +1,11 @@
 name: Sync upstream to my-rules
 
 on:
+  push:
+    branches:
+      - release
+    paths:
+      - ".github/workflows/sync-upstream-to-my-rules.yml"
   schedule:
     # GitHub Actions cannot be triggered directly by another repository's push,
     # so this polls upstream every 6 hours and exits cleanly when nothing changed.
