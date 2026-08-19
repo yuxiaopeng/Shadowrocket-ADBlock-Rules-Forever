@@ -1,0 +1,38 @@
+name: Test my-rules renderer
+
+on:
+  push:
+    branches:
+      - release
+    paths:
+      - ".github/workflows/sync-upstream-to-my-rules.yml"
+      - ".github/workflows/test-my-rules-renderer.yml"
+      - "automation/my-rules/**"
+      - "scripts/render_my_rules.py"
+      - "tests/**"
+  pull_request:
+    branches:
+      - release
+    paths:
+      - ".github/workflows/sync-upstream-to-my-rules.yml"
+      - ".github/workflows/test-my-rules-renderer.yml"
+      - "automation/my-rules/**"
+      - "scripts/render_my_rules.py"
+      - "tests/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Test renderer
+        run: python3 -m unittest discover -s tests -v

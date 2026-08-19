@@ -1,0 +1,56 @@
+schema_version = 1
+core_sections = ["General", "Rule", "URL Rewrite", "MITM"]
+
+[general.ensure]
+prefer-ipv6 = "false"
+fallback-dns-server = "system"
+dns-direct-system = "false"
+icmp-auto-reply = "true"
+always-reject-url-rewrite = "false"
+private-ip-answer = "true"
+dns-direct-fallback-proxy = "false"
+udp-policy-not-supported-behaviour = "REJECT"
+
+[general.append_unique]
+skip-proxy = [
+  "www.baidu.com",
+  "yunbusiness.ccb.com",
+  "wxh.wo.cn",
+  "gate.lagou.com",
+  "www.abchina.com.cn",
+  "www.shanbay.com",
+  "login-service.mobile-bank.psbc.com",
+  "mobile-bank.psbc.com",
+  "id6.me",
+  "www.163.com",
+]
+always-real-ip = [
+  "easy-login.10099.com.cn",
+  "*-update.xoyocdn.com",
+  "id6.me",
+  "open.e.189.cn",
+]
+
+[host]
+insert_before = "URL Rewrite"
+
+[host.ensure]
+localhost = "127.0.0.1"
+
+[mitm.ensure]
+enable = "true"
+
+[mitm.append_unique]
+hostname = ["*.google.cn", "*.googlevideo.com"]
+
+[rules]
+prepend = "rules.prepend.conf"
+before_terminal = "rules.before-terminal.conf"
+insertion_anchor = "RULE-SET,https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Shadowrocket/AppleNews/AppleNews.list,PROXY"
+terminal_anchor = "FINAL,direct"
+
+[budget]
+max_added_lines = 64
+max_removed_lines = 512
+max_modified_lines = 32
+max_output_growth_bytes = 65536

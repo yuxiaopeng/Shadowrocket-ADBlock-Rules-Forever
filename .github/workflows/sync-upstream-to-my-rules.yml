@@ -6,6 +6,10 @@ on:
       - release
     paths:
       - ".github/workflows/sync-upstream-to-my-rules.yml"
+      - ".github/workflows/test-my-rules-renderer.yml"
+      - "automation/my-rules/**"
+      - "scripts/render_my_rules.py"
+      - "tests/**"
   schedule:
     # GitHub Actions cannot be triggered directly by another repository's push,
     # so this polls upstream every 6 hours and exits cleanly when nothing changed.
@@ -22,79 +26,123 @@ concurrency:
 env:
   UPSTREAM_REPO: Johnshall/Shadowrocket-ADBlock-Rules-Forever
   UPSTREAM_BRANCH: release
-  UPSTREAM_HISTORY_BRANCH: upstream-release-history
   TARGET_BRANCH: my-rules
+  TARGET_FILE: sr_top500_banlist_ad.conf
+  STATE_FILE: .my-rules-sync-state.json
+  OVERLAY_FILE: automation/my-rules/sr_top500_banlist_ad/overlay.toml
 
 jobs:
   sync:
+    if: github.ref == 'refs/heads/release'
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout control files
         uses: actions/checkout@v6
         with:
+          ref: release
+          path: control
+          persist-credentials: false
+
+      - name: Test renderer
+        run: python3 -m unittest discover -s control/tests -v
+
+      - name: Checkout upstream rules
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_BRANCH }}
+          path: upstream
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout my-rules
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          path: target
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Configure git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Fetch upstream and local branches
+      - name: Record source revisions
         run: |
           set -euo pipefail
 
-          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
-          git fetch --no-tags upstream "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
-          git fetch --no-tags origin "+refs/heads/${UPSTREAM_HISTORY_BRANCH}:refs/remotes/origin/${UPSTREAM_HISTORY_BRANCH}" || true
-          git fetch --no-tags origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}" || true
+          echo "UPSTREAM_SHA=$(git -C upstream rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "TARGET_START_SHA=$(git -C target rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      - name: Update upstream history branch
+      - name: Verify current target provenance
         run: |
           set -euo pipefail
 
-          upstream_ref="upstream/${UPSTREAM_BRANCH}"
-          upstream_sha="$(git rev-parse "${upstream_ref}")"
-
-          if git show-ref --verify --quiet "refs/remotes/origin/${UPSTREAM_HISTORY_BRANCH}"; then
-            git checkout -B "${UPSTREAM_HISTORY_BRANCH}" "origin/${UPSTREAM_HISTORY_BRANCH}"
+          if [[ -f "target/${STATE_FILE}" ]]; then
+            python3 control/scripts/render_my_rules.py verify-state \
+              --output "target/${TARGET_FILE}" \
+              --state "target/${STATE_FILE}"
           else
-            git checkout --orphan "${UPSTREAM_HISTORY_BRANCH}"
-            git rm -rf . >/dev/null 2>&1 || true
-            git clean -fdx >/dev/null 2>&1
+            python3 control/scripts/render_my_rules.py validate-history \
+              --repository target \
+              --tip HEAD
           fi
 
-          if git rev-parse --verify HEAD >/dev/null 2>&1 && git diff --quiet HEAD "${upstream_ref}" --; then
-            echo "Upstream tree is already tracked at ${upstream_sha}."
-            exit 0
-          fi
-
-          git read-tree --reset -u "${upstream_ref}"
-          git commit -m "Sync upstream release ${upstream_sha}"
-          git push origin "HEAD:${UPSTREAM_HISTORY_BRANCH}"
-
-      - name: Merge upstream history into my-rules
+      - name: Rebuild my-rules from upstream
         run: |
           set -euo pipefail
 
-          git fetch --no-tags origin "+refs/heads/${UPSTREAM_HISTORY_BRANCH}:refs/remotes/origin/${UPSTREAM_HISTORY_BRANCH}"
+          python3 control/scripts/render_my_rules.py render \
+            --input "upstream/${TARGET_FILE}" \
+            --output "target/${TARGET_FILE}" \
+            --state "target/${STATE_FILE}" \
+            --overlay "control/${OVERLAY_FILE}" \
+            --upstream-commit "${UPSTREAM_SHA}"
 
-          if git show-ref --verify --quiet "refs/remotes/origin/${TARGET_BRANCH}"; then
-            git checkout -B "${TARGET_BRANCH}" "origin/${TARGET_BRANCH}"
-          else
-            git checkout -B "${TARGET_BRANCH}" "origin/${UPSTREAM_HISTORY_BRANCH}"
-            git push -u origin "HEAD:${TARGET_BRANCH}"
-            echo "Created ${TARGET_BRANCH} from ${UPSTREAM_HISTORY_BRANCH}."
+          python3 control/scripts/render_my_rules.py check \
+            --input "upstream/${TARGET_FILE}" \
+            --output "target/${TARGET_FILE}" \
+            --overlay "control/${OVERLAY_FILE}"
+
+          # Reapplying the overlay to its own output must be a byte-for-byte no-op.
+          python3 control/scripts/render_my_rules.py check \
+            --input "target/${TARGET_FILE}" \
+            --output "target/${TARGET_FILE}" \
+            --overlay "control/${OVERLAY_FILE}"
+
+      - name: Verify change scope
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r path; do
+            case "${path}" in
+              "${TARGET_FILE}"|"${STATE_FILE}") ;;
+              *)
+                echo "Unexpected target change: ${path}" >&2
+                exit 1
+                ;;
+            esac
+          done < <(git -C target status --porcelain=v1 --untracked-files=all | cut -c4-)
+
+      - name: Commit and push rebuilt rules
+        run: |
+          set -euo pipefail
+
+          git -C target config user.name "github-actions[bot]"
+          git -C target config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C target add -- "${TARGET_FILE}" "${STATE_FILE}"
+
+          if git -C target diff --cached --quiet; then
+            echo "my-rules already matches upstream ${UPSTREAM_SHA}."
             exit 0
           fi
 
-          if git merge-base --is-ancestor "origin/${UPSTREAM_HISTORY_BRANCH}" HEAD; then
-            echo "${TARGET_BRANCH} already contains the latest upstream history."
-            exit 0
+          git -C target commit \
+            -m "sync(my-rules): rebuild from upstream ${UPSTREAM_SHA:0:12}" \
+            -m "Upstream-Commit: ${UPSTREAM_SHA}"
+
+          git -C target fetch --no-tags origin "refs/heads/${TARGET_BRANCH}"
+          remote_sha="$(git -C target rev-parse FETCH_HEAD)"
+          if [[ "${remote_sha}" != "${TARGET_START_SHA}" ]]; then
+            echo "${TARGET_BRANCH} advanced from ${TARGET_START_SHA} to ${remote_sha}; refusing to overwrite it." >&2
+            exit 1
           fi
 
-          # Apply upstream changes while preserving custom my-rules edits when
-          # both sides changed the same generated rule lines.
-          git merge --no-edit -X ours "origin/${UPSTREAM_HISTORY_BRANCH}"
-          git push origin "HEAD:${TARGET_BRANCH}"
+          git -C target push origin "HEAD:refs/heads/${TARGET_BRANCH}"
