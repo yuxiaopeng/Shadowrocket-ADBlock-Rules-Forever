@@ -4,32 +4,70 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
+import ipaddress
 import json
 import os
 import re
-import subprocess
 import sys
 import tempfile
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-BOOTSTRAP_COMMIT = "d804e583d2777a8c609e8e55362365c88a8debae"
-EXPECTED_MERGE_SUBJECT = (
-    "Merge remote-tracking branch 'origin/upstream-release-history' into my-rules"
-)
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OVERLAY = (
+DEFAULT_CUSTOM_CONFIG = (
     REPOSITORY_ROOT
     / "automation"
     / "my-rules"
     / "sr_top500_banlist_ad"
-    / "overlay.toml"
+    / "custom.conf"
 )
 SECTION_HEADER = re.compile(r"^\[([^\[\]]+)\]$")
 ASSIGNMENT = re.compile(r"^([^=]+?)\s*=\s*(.*)$")
+DOMAIN_RULE_TYPES = {"DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD"}
+RULE_TYPES = {
+    *DOMAIN_RULE_TYPES,
+    "DOMAIN-SET",
+    "IP-CIDR",
+    "IP-CIDR6",
+    "GEOIP",
+    "USER-AGENT",
+    "URL-REGEX",
+    "PROCESS-NAME",
+    "PROCESS-PATH",
+    "DEST-PORT",
+    "DST-PORT",
+    "SRC-IP",
+    "SRC-PORT",
+    "IN-PORT",
+    "PROTOCOL",
+    "RULE-SET",
+    "SCRIPT",
+    "AND",
+    "OR",
+    "NOT",
+}
+COMPOUND_DOMAIN_MATCHER = re.compile(
+    r"(?i)(?<![A-Z0-9-])(DOMAIN(?:-SUFFIX|-KEYWORD)?),([^,()]+)"
+)
+COMPOUND_PROTOCOL_MATCHER = re.compile(
+    r"(?i)(?<![A-Z0-9-])PROTOCOL,([^,()]+)"
+)
+COMPOUND_RULE_TYPE = re.compile(
+    r"(?i)(?<![A-Z0-9-])("
+    + "|".join(sorted(RULE_TYPES, key=len, reverse=True))
+    + r")(?=,)"
+)
+UNION_GENERAL_KEYS = {"skip-proxy", "always-real-ip"}
+CASEFOLD_MATCHER_TYPES = {"GEOIP", "PROTOCOL"}
+CASEFOLD_MODIFIERS = {"no-resolve", "extended-matching", "pre-matching"}
+CUSTOM_SECTIONS = ("General", "Rule", "Host", "URL Rewrite", "MITM")
+MAX_ADDED_LINES = 64
+MAX_REMOVED_LINES = 512
+MAX_MODIFIED_LINES = 32
+MAX_OUTPUT_GROWTH_BYTES = 65536
 
 
 class RenderError(RuntimeError):
@@ -55,6 +93,12 @@ class Document:
             )
         return matches[0]
 
+    def optional_section(self, name: str) -> Section | None:
+        matches = [section for section in self.sections if section.name == name]
+        if len(matches) > 1:
+            raise RenderError(f"expected at most one [{name}] section, found {len(matches)}")
+        return matches[0] if matches else None
+
     def serialize(self) -> bytes:
         lines = list(self.preamble)
         for section in self.sections:
@@ -64,21 +108,12 @@ class Document:
 
 
 @dataclass(frozen=True)
-class Overlay:
-    path: Path
+class CustomConfig:
     digest: str
-    core_sections: tuple[str, ...]
-    general_ensure: Mapping[str, str]
-    general_append_unique: Mapping[str, tuple[str, ...]]
-    host_insert_before: str
-    host_ensure: Mapping[str, str]
-    mitm_ensure: Mapping[str, str]
-    mitm_append_unique: Mapping[str, tuple[str, ...]]
-    rules_prepend: tuple[str, ...]
-    rules_before_terminal: tuple[str, ...]
-    insertion_anchor: tuple[str, ...]
-    terminal_anchor: tuple[str, ...]
-    budget: Mapping[str, int]
+    document: Document
+
+    def section(self, name: str) -> Section:
+        return self.document.section(name)
 
 
 @dataclass
@@ -101,38 +136,21 @@ class RenderStats:
     output_growth_bytes: int = 0
 
     def as_dict(self) -> dict[str, int]:
-        return {
-            key: value
-            for key, value in self.__dict__.items()
-        }
+        return dict(self.__dict__)
 
 
 @dataclass(frozen=True)
 class RenderResult:
     output: bytes
-    overlay_sha256: str
+    custom_sha256: str
     stats: Mapping[str, int]
 
 
 @dataclass(frozen=True)
-class HistoryCommit:
-    oid: str
-    parents: tuple[str, ...]
-    subject: str
-
-
-@dataclass(frozen=True)
-class HistoryValidation:
-    bootstrap_commit: str
-    tip_commit: str
-    merge_count: int
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "bootstrap_commit": self.bootstrap_commit,
-            "tip_commit": self.tip_commit,
-            "merge_count": self.merge_count,
-        }
+class RuleEntry:
+    kind: str
+    identity: tuple[str, ...] | str | None
+    assignment_key: str | None = None
 
 
 def sha256(data: bytes) -> str:
@@ -175,9 +193,7 @@ def parse_document(data: bytes, source: str = "input") -> Document:
         if match:
             name = match.group(1)
             if name in seen:
-                raise RenderError(
-                    f"{source}:{line_number}: duplicate [{name}] section"
-                )
+                raise RenderError(f"{source}:{line_number}: duplicate [{name}] section")
             seen.add(name)
             current = Section(name=name, body=[])
             sections.append(current)
@@ -185,393 +201,491 @@ def parse_document(data: bytes, source: str = "input") -> Document:
             preamble.append(line)
         else:
             current.body.append(line)
-
     return Document(preamble=preamble, sections=sections)
 
 
-def _expect_table(root: Mapping[str, Any], key: str) -> Mapping[str, Any]:
-    value = root.get(key)
-    if not isinstance(value, dict):
-        raise RenderError(f"overlay key {key!r} must be a table")
-    return value
-
-
-def _expect_string_map(root: Mapping[str, Any], key: str) -> dict[str, str]:
-    table = _expect_table(root, key)
-    result: dict[str, str] = {}
-    for item_key, value in table.items():
-        if not isinstance(item_key, str) or not isinstance(value, str):
-            raise RenderError(f"overlay table {key!r} must contain string values")
-        result[item_key] = value
-    return result
-
-
-def _expect_string_list_map(
-    root: Mapping[str, Any], key: str
-) -> dict[str, tuple[str, ...]]:
-    table = _expect_table(root, key)
-    result: dict[str, tuple[str, ...]] = {}
-    for item_key, value in table.items():
-        if not isinstance(value, list) or not all(
-            isinstance(item, str) and item for item in value
-        ):
-            raise RenderError(
-                f"overlay table {key!r} must contain non-empty string arrays"
-            )
-        if len(value) != len(set(value)):
-            raise RenderError(f"overlay list {key}.{item_key} contains duplicates")
-        result[item_key] = tuple(value)
-    return result
-
-
-def _resolve_fragment(overlay_path: Path, reference: str) -> Path:
-    if not reference:
-        raise RenderError("overlay fragment reference must not be empty")
-    overlay_directory = overlay_path.parent.resolve()
-    fragment = (overlay_directory / reference).resolve()
-    try:
-        fragment.relative_to(overlay_directory)
-    except ValueError as error:
-        raise RenderError(
-            f"overlay fragment {reference!r} escapes {overlay_directory}"
-        ) from error
-    return fragment
-
-
-def _fragment_lines(data: bytes, source: str) -> tuple[str, ...]:
-    text = decode_strict_text(data, source)
-    lines = tuple(text[:-1].split("\n"))
-    if not lines or all(not line for line in lines):
-        raise RenderError(f"overlay fragment {source} must not be empty")
-    return lines
-
-
-def _hash_overlay(
-    overlay_bytes: bytes, fragments: Sequence[tuple[str, str, bytes]]
-) -> str:
-    digest = hashlib.sha256()
-    entries = [("overlay.toml", "overlay.toml", overlay_bytes), *fragments]
-    for role, relative_path, data in entries:
-        for part in (role.encode(), relative_path.encode(), data):
-            digest.update(len(part).to_bytes(8, "big"))
-            digest.update(part)
-    return digest.hexdigest()
-
-
-def load_overlay(path: Path = DEFAULT_OVERLAY) -> Overlay:
-    path = path.resolve()
-    overlay_bytes = read_strict_file(path)
-    try:
-        raw = tomllib.loads(overlay_bytes.decode("utf-8"))
-    except tomllib.TOMLDecodeError as error:
-        raise RenderError(f"invalid overlay TOML {path}: {error}") from error
-
-    if raw.get("schema_version") != 1:
-        raise RenderError("overlay schema_version must be 1")
-    core_sections_raw = raw.get("core_sections")
-    if not isinstance(core_sections_raw, list) or not all(
-        isinstance(item, str) and item for item in core_sections_raw
-    ):
-        raise RenderError("overlay core_sections must be a non-empty string array")
-    if not core_sections_raw or len(core_sections_raw) != len(set(core_sections_raw)):
-        raise RenderError("overlay core_sections must be non-empty and unique")
-
-    general = _expect_table(raw, "general")
-    host = _expect_table(raw, "host")
-    mitm = _expect_table(raw, "mitm")
-    rules = _expect_table(raw, "rules")
-    budget_raw = _expect_table(raw, "budget")
-
-    host_insert_before = host.get("insert_before")
-    if not isinstance(host_insert_before, str) or not host_insert_before:
-        raise RenderError("overlay host.insert_before must be a non-empty string")
-
-    fragment_specs: list[tuple[str, str, bytes]] = []
-    fragment_values: dict[str, tuple[str, ...]] = {}
-    for role in ("prepend", "before_terminal"):
-        reference = rules.get(role)
-        if not isinstance(reference, str):
-            raise RenderError(f"overlay rules.{role} must be a string")
-        fragment_path = _resolve_fragment(path, reference)
-        fragment_bytes = read_strict_file(fragment_path)
-        fragment_specs.append((f"rules.{role}", reference, fragment_bytes))
-        fragment_values[role] = _fragment_lines(fragment_bytes, str(fragment_path))
-
-    anchors: dict[str, tuple[str, ...]] = {}
-    for name in ("insertion_anchor", "terminal_anchor"):
-        value = rules.get(name)
-        if not isinstance(value, str):
-            raise RenderError(f"overlay rules.{name} must be a string")
-        normalized = normalize_rule(value)
-        if normalized is None:
-            raise RenderError(f"overlay rules.{name} must be an active rule")
-        anchors[name] = normalized
-
-    expected_budget_keys = {
-        "max_added_lines",
-        "max_removed_lines",
-        "max_modified_lines",
-        "max_output_growth_bytes",
-    }
-    if set(budget_raw) != expected_budget_keys:
-        raise RenderError(
-            "overlay budget must define exactly " + ", ".join(sorted(expected_budget_keys))
-        )
-    budget: dict[str, int] = {}
-    for key, value in budget_raw.items():
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise RenderError(f"overlay budget {key} must be a non-negative integer")
-        budget[key] = value
-
-    return Overlay(
-        path=path,
-        digest=_hash_overlay(overlay_bytes, fragment_specs),
-        core_sections=tuple(core_sections_raw),
-        general_ensure=_expect_string_map(general, "ensure"),
-        general_append_unique=_expect_string_list_map(general, "append_unique"),
-        host_insert_before=host_insert_before,
-        host_ensure=_expect_string_map(host, "ensure"),
-        mitm_ensure=_expect_string_map(mitm, "ensure"),
-        mitm_append_unique=_expect_string_list_map(mitm, "append_unique"),
-        rules_prepend=fragment_values["prepend"],
-        rules_before_terminal=fragment_values["before_terminal"],
-        insertion_anchor=anchors["insertion_anchor"],
-        terminal_anchor=anchors["terminal_anchor"],
-        budget=budget,
-    )
-
-
-def normalize_rule(line: str) -> tuple[str, ...] | None:
+def _is_comment_or_blank(line: str) -> bool:
     stripped = line.strip()
-    if not stripped or stripped.startswith(("#", ";")) or "," not in stripped:
-        return None
-    first_field = stripped.split(",", 1)[0]
-    if "=" in first_field:
-        return None
-    fields = tuple(field.strip() for field in stripped.split(","))
-    if len(fields) < 2 or not fields[0] or any(not field for field in fields):
-        return None
-    return fields
+    return not stripped or stripped.startswith(("#", ";"))
 
 
-def _assignment_index(section: Section) -> dict[str, tuple[int, str]]:
+def _assignment(line: str) -> tuple[str, str] | None:
+    if _is_comment_or_blank(line):
+        return None
+    match = ASSIGNMENT.fullmatch(line)
+    if match is None:
+        return None
+    return match.group(1).strip(), match.group(2).strip()
+
+
+def _assignment_index(section: Section, source: str) -> dict[str, tuple[int, str]]:
     assignments: dict[str, tuple[int, str]] = {}
     for index, line in enumerate(section.body):
-        stripped = line.strip()
-        if not stripped or stripped.startswith(("#", ";")):
+        parsed = _assignment(line)
+        if parsed is None:
             continue
-        match = ASSIGNMENT.fullmatch(line)
-        if not match:
-            continue
-        key = match.group(1).strip()
-        value = match.group(2).strip()
+        key, value = parsed
         if key in assignments:
-            raise RenderError(f"duplicate key {key!r} in [{section.name}]")
+            raise RenderError(f"duplicate key {key!r} in {source} [{section.name}]")
         assignments[key] = (index, value)
     return assignments
 
 
-def _named_assignments(
-    lines: Sequence[str], source: str, names: set[str] | None = None
-) -> dict[str, str]:
-    assignments: dict[str, str] = {}
-    for line in lines:
+def _require_assignment_section(section: Section, source: str) -> None:
+    _assignment_index(section, source)
+    for line_number, line in enumerate(section.body, start=1):
+        if not _is_comment_or_blank(line) and _assignment(line) is None:
+            raise RenderError(
+                f"{source} [{section.name}] line {line_number} must be an assignment"
+            )
+
+
+def _trim_blank_edges(lines: Sequence[str]) -> list[str]:
+    start = 0
+    end = len(lines)
+    while start < end and not lines[start]:
+        start += 1
+    while end > start and not lines[end - 1]:
+        end -= 1
+    return list(lines[start:end])
+
+
+def _custom_comment_lines(section: Section) -> set[str]:
+    return {
+        line.strip()
+        for line in section.body
+        if line.strip().startswith(("#", ";"))
+    }
+
+
+def _compose_custom_first(
+    custom_lines: Sequence[str], upstream_lines: Sequence[str], trailing_blank: bool
+) -> list[str]:
+    custom = _trim_blank_edges(custom_lines)
+    upstream = _trim_blank_edges(upstream_lines)
+    body = custom
+    if custom and upstream:
+        body.append("")
+    body.extend(upstream)
+    if trailing_blank:
+        body.append("")
+    return body
+
+
+def _dedupe_values(values: Sequence[str], case_insensitive: bool = False) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = value.casefold() if case_insensitive else value
+        if normalized not in seen:
+            seen.add(normalized)
+            result.append(value)
+    return result
+
+
+def _comma_values(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _render_assignment_section(
+    upstream: Section,
+    custom: Section,
+    union_keys: set[str] = frozenset(),
+    case_insensitive_union_keys: set[str] = frozenset(),
+) -> tuple[list[str], int, int, list[str]]:
+    upstream_assignments = _assignment_index(upstream, "upstream")
+    custom_assignments = _assignment_index(custom, "custom config")
+    custom_comments = _custom_comment_lines(custom)
+    rendered_custom: list[str] = []
+    values_added = 0
+    list_values_added = 0
+
+    for line in custom.body:
+        parsed = _assignment(line)
+        if parsed is None:
+            rendered_custom.append(line)
+            continue
+        key, custom_value = parsed
+        if key not in union_keys:
+            rendered_custom.append(line)
+            if key not in upstream_assignments:
+                values_added += 1
+            continue
+        custom_values = _comma_values(custom_value)
+        upstream_values = _comma_values(upstream_assignments.get(key, (-1, ""))[1])
+        case_insensitive = key in case_insensitive_union_keys
+        merged = _dedupe_values(
+            [*custom_values, *upstream_values], case_insensitive=case_insensitive
+        )
+        upstream_keys = {
+            value.casefold() if case_insensitive else value for value in upstream_values
+        }
+        list_values_added += sum(
+            (value.casefold() if case_insensitive else value) not in upstream_keys
+            for value in custom_values
+        )
+        rendered_custom.append(f"{key} = {', '.join(merged)}")
+        if key not in upstream_assignments:
+            values_added += 1
+
+    residual: list[str] = []
+    for line in upstream.body:
+        parsed = _assignment(line)
+        if parsed is not None and parsed[0] in custom_assignments:
+            continue
+        if line.strip() in custom_comments:
+            continue
+        residual.append(line)
+    return rendered_custom, values_added, list_values_added, residual
+
+
+def _top_level_comma_fields(line: str, source: str) -> tuple[str, ...]:
+    fields: list[str] = []
+    start = 0
+    depth = 0
+    for index, character in enumerate(line):
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth < 0:
+                raise RenderError(f"{source}: unbalanced parentheses")
+        elif character == "," and depth == 0:
+            fields.append(line[start:index].strip())
+            start = index + 1
+    if depth != 0:
+        raise RenderError(f"{source}: unbalanced parentheses")
+    fields.append(line[start:].strip())
+    if any(not field for field in fields):
+        raise RenderError(f"{source}: empty top-level rule field")
+    return tuple(fields)
+
+
+def _normalize_compound_matcher(value: str) -> str:
+    normalized = re.sub(r"\s*([(),])\s*", r"\1", value.strip())
+    normalized = COMPOUND_DOMAIN_MATCHER.sub(
+        lambda match: f"{match.group(1).upper()},{match.group(2).casefold()}",
+        normalized,
+    )
+    normalized = COMPOUND_PROTOCOL_MATCHER.sub(
+        lambda match: f"PROTOCOL,{match.group(1).casefold()}", normalized
+    )
+    return COMPOUND_RULE_TYPE.sub(lambda match: match.group(1).upper(), normalized)
+
+
+def _normalize_rule_matcher(rule_type: str, matcher: str, source: str) -> str:
+    if rule_type in DOMAIN_RULE_TYPES or rule_type in CASEFOLD_MATCHER_TYPES:
+        return matcher.casefold()
+    if rule_type in {"IP-CIDR", "IP-CIDR6"}:
+        try:
+            return str(ipaddress.ip_network(matcher, strict=False))
+        except ValueError as error:
+            raise RenderError(f"{source}: invalid {rule_type} matcher {matcher!r}") from error
+    if rule_type in {"AND", "OR", "NOT"}:
+        return _normalize_compound_matcher(matcher)
+    return matcher
+
+
+def parse_rule_entry(line: str, source: str, custom: bool = False) -> RuleEntry:
+    stripped = line.strip()
+    if not stripped or stripped.startswith(("#", ";")):
+        return RuleEntry("trivia", None)
+    assignment = _assignment(line)
+    first_comma = stripped.find(",")
+    equals = stripped.find("=")
+    if assignment is not None and (first_comma < 0 or equals < first_comma):
+        return RuleEntry("assignment", assignment[0], assignment[0])
+
+    first = stripped.split(",", 1)[0].strip().upper()
+    if first == "FINAL":
+        fields = _top_level_comma_fields(stripped, source)
+        if len(fields) != 2:
+            raise RenderError(f"{source}: FINAL must contain exactly a policy/action")
+        return RuleEntry("final", ("FINAL",))
+    if first in RULE_TYPES:
+        fields = _top_level_comma_fields(stripped, source)
+        if len(fields) < 3:
+            raise RenderError(
+                f"{source}: {fields[0]} must contain a matcher and policy/action"
+            )
+        rule_type = fields[0].upper()
+        matcher = _normalize_rule_matcher(rule_type, fields[1], source)
+        modifiers = tuple(
+            field.casefold() if field.casefold() in CASEFOLD_MODIFIERS else field
+            for field in fields[3:]
+        )
+        identity = (rule_type, matcher, *modifiers)
+        return RuleEntry("structured", identity)
+    if custom:
+        raise RenderError(f"{source}: unknown custom rule type {first!r}")
+    return RuleEntry("opaque", stripped)
+
+
+def _validate_custom_rules(section: Section) -> None:
+    identities: set[tuple[str, ...]] = set()
+    assignments: set[str] = set()
+    final_count = 0
+    for index, line in enumerate(section.body, start=1):
+        entry = parse_rule_entry(line, f"custom [Rule] line {index}", custom=True)
+        if entry.kind == "structured":
+            assert isinstance(entry.identity, tuple)
+            if entry.identity in identities:
+                raise RenderError(
+                    f"custom [Rule] contains duplicate matcher identity at line {index}"
+                )
+            identities.add(entry.identity)
+        elif entry.kind == "assignment":
+            assert entry.assignment_key is not None
+            if entry.assignment_key in assignments:
+                raise RenderError(
+                    f"custom [Rule] contains duplicate named assignment {entry.assignment_key!r}"
+                )
+            assignments.add(entry.assignment_key)
+        elif entry.kind == "final":
+            final_count += 1
+            if final_count > 1:
+                raise RenderError("custom [Rule] contains more than one FINAL rule")
+
+
+def _validate_custom_rewrites(section: Section) -> None:
+    seen: set[str] = set()
+    for index, line in enumerate(section.body, start=1):
         stripped = line.strip()
         if not stripped or stripped.startswith(("#", ";")):
             continue
-        match = ASSIGNMENT.fullmatch(line)
-        if match is None:
-            continue
-        key = match.group(1).strip()
-        if names is not None and key not in names:
-            continue
-        value = match.group(2).strip()
-        if key in assignments:
-            raise RenderError(f"duplicate named assignment {key!r} in {source}")
-        assignments[key] = value
-    return assignments
-
-
-def _insert_before_trailing_blanks(body: list[str], lines: Sequence[str]) -> None:
-    index = len(body)
-    while index > 0 and not body[index - 1]:
-        index -= 1
-    body[index:index] = lines
-
-
-def _apply_key_overlay(
-    section: Section,
-    ensure: Mapping[str, str],
-    append_unique: Mapping[str, tuple[str, ...]],
-    stats: RenderStats,
-    count_general_values: bool = False,
-) -> None:
-    assignments = _assignment_index(section)
-    additions: list[str] = []
-
-    for key, expected in ensure.items():
-        existing = assignments.get(key)
-        if existing is None:
-            additions.append(f"{key} = {expected}")
-            if count_general_values:
-                stats.general_values_added += 1
-        elif existing[1] != expected:
+        identity = stripped.split(None, 1)[0]
+        if identity in seen:
             raise RenderError(
-                f"conflicting [{section.name}] value for {key!r}: "
-                f"expected {expected!r}, found {existing[1]!r}"
+                f"custom [URL Rewrite] contains duplicate identity {identity!r} at line {index}"
             )
-
-    for key, required_values in append_unique.items():
-        existing = assignments.get(key)
-        if existing is None:
-            additions.append(f"{key} = {', '.join(required_values)}")
-            stats.list_values_appended += len(required_values)
-            continue
-        index, raw_value = existing
-        values = [value.strip() for value in raw_value.split(",") if value.strip()]
-        missing = [value for value in required_values if value not in values]
-        if missing:
-            section.body[index] = (
-                f"{key} = {', '.join([*values, *missing])}"
-            )
-            stats.modified_lines += 1
-            stats.list_values_appended += len(missing)
-
-    if additions:
-        _insert_before_trailing_blanks(section.body, additions)
-        stats.added_lines += len(additions)
+        seen.add(identity)
 
 
-def _contains_fragment(body: Sequence[str], fragment: Sequence[str]) -> bool:
-    if len(fragment) > len(body):
-        return False
-    return any(
-        tuple(body[index : index + len(fragment)]) == tuple(fragment)
-        for index in range(len(body) - len(fragment) + 1)
-    )
-
-
-def _apply_rule_overlay(
-    section: Section, overlay: Overlay, stats: RenderStats
-) -> None:
-    terminal_indexes = [
-        index
-        for index, line in enumerate(section.body)
-        if normalize_rule(line) == overlay.terminal_anchor
-    ]
-    if len(terminal_indexes) != 1:
+def load_custom_config(path: Path = DEFAULT_CUSTOM_CONFIG) -> CustomConfig:
+    path = path.resolve()
+    data = read_strict_file(path)
+    document = parse_document(data, str(path))
+    allowed = {"Overlay", *CUSTOM_SECTIONS}
+    unexpected = [section.name for section in document.sections if section.name not in allowed]
+    if unexpected:
         raise RenderError(
-            "terminal anchor "
-            f"{','.join(overlay.terminal_anchor)!r} must occur exactly once; "
-            f"found {len(terminal_indexes)}"
+            "custom config contains unsupported sections: "
+            + ", ".join(f"[{name}]" for name in unexpected)
         )
-    terminal_index = terminal_indexes[0]
-
-    insertion_indexes = [
-        index
-        for index, line in enumerate(section.body)
-        if normalize_rule(line) == overlay.insertion_anchor
-    ]
-    if len(insertion_indexes) != 1:
+    missing = [name for name in ("Overlay", *CUSTOM_SECTIONS) if document.optional_section(name) is None]
+    if missing:
         raise RenderError(
-            "insertion anchor "
-            f"{','.join(overlay.insertion_anchor)!r} must occur exactly once; "
-            f"found {len(insertion_indexes)}"
+            "custom config is missing sections: "
+            + ", ".join(f"[{name}]" for name in missing)
         )
-    insertion_index = insertion_indexes[0]
-    if insertion_index >= terminal_index:
-        raise RenderError("insertion anchor must occur before the terminal anchor")
-    if any(normalize_rule(line) is not None for line in section.body[terminal_index + 1 :]):
-        raise RenderError("terminal anchor is not the last active rule")
+    overlay = document.section("Overlay")
+    _require_assignment_section(overlay, "custom config")
+    overlay_assignments = _assignment_index(overlay, "custom config")
+    if set(overlay_assignments) != {"schema-version"}:
+        raise RenderError("[Overlay] must define exactly schema-version")
+    if overlay_assignments["schema-version"][1] != "1":
+        raise RenderError("custom config schema-version must be 1")
+    for name in ("General", "Host", "MITM"):
+        _require_assignment_section(document.section(name), "custom config")
+    _validate_custom_rules(document.section("Rule"))
+    _validate_custom_rewrites(document.section("URL Rewrite"))
+    return CustomConfig(digest=sha256(data), document=document)
 
-    prepend_block = (*overlay.rules_prepend, "")
-    prepend_is_canonical = tuple(section.body[: len(prepend_block)]) == prepend_block
-    if not prepend_is_canonical:
-        if _contains_fragment(section.body, overlay.rules_prepend):
-            raise RenderError("rules.prepend fragment is present outside its canonical prefix")
-        section.body[0:0] = prepend_block
-        stats.added_lines += len(prepend_block)
-        stats.rule_fragments_added += 1
-        insertion_index += len(prepend_block)
 
-    before_block = (*overlay.rules_before_terminal, "")
-    before_start = insertion_index - len(before_block)
-    before_is_canonical = (
-        before_start >= 0
-        and tuple(section.body[before_start:insertion_index]) == before_block
+def _merge_general(document: Document, custom: CustomConfig, stats: RenderStats) -> None:
+    section = document.section("General")
+    trailing_blank = bool(section.body and not section.body[-1])
+    custom_lines, added, list_added, residual = _render_assignment_section(
+        section,
+        custom.section("General"),
+        union_keys=UNION_GENERAL_KEYS,
+        case_insensitive_union_keys=UNION_GENERAL_KEYS,
     )
-    fragment_assignments = _named_assignments(
-        overlay.rules_before_terminal, "rules.before_terminal"
-    )
-    existing_assignments = _named_assignments(
-        section.body, "[Rule]", set(fragment_assignments)
-    )
-    for key, expected in fragment_assignments.items():
-        existing = existing_assignments.get(key)
-        if existing is not None and existing != expected:
-            raise RenderError(
-                f"conflicting Rule assignment {key!r}: expected "
-                f"{expected!r}, found {existing!r}"
-            )
-        if existing is not None and not before_is_canonical:
-            raise RenderError(
-                f"Rule assignment {key!r} is outside its canonical insertion position"
-            )
+    section.body = _compose_custom_first(custom_lines, residual, trailing_blank)
+    stats.general_values_added += added
+    stats.list_values_appended += list_added
 
-    if not before_is_canonical:
-        if _contains_fragment(section.body, overlay.rules_before_terminal):
-            raise RenderError(
-                "rules.before_terminal fragment is outside its canonical insertion position"
-            )
-        section.body[insertion_index:insertion_index] = before_block
-        stats.added_lines += len(before_block)
-        stats.rule_fragments_added += 1
 
-    seen: set[tuple[str, ...]] = set()
-    deduplicated: list[str] = []
+def _merge_host(document: Document, custom: CustomConfig, stats: RenderStats) -> None:
+    section = document.optional_section("Host")
+    if section is None:
+        rewrite_index = next(
+            (index for index, item in enumerate(document.sections) if item.name == "URL Rewrite"),
+            None,
+        )
+        if rewrite_index is None:
+            raise RenderError("cannot create [Host] without a [URL Rewrite] section")
+        section = Section("Host", [""])
+        document.sections.insert(rewrite_index, section)
+        stats.sections_added += 1
+    trailing_blank = bool(section.body and not section.body[-1])
+    custom_lines, _, _, residual = _render_assignment_section(
+        section, custom.section("Host")
+    )
+    section.body = _compose_custom_first(custom_lines, residual, trailing_blank)
+
+
+def _merge_mitm(document: Document, custom: CustomConfig, stats: RenderStats) -> None:
+    section = document.section("MITM")
+    trailing_blank = bool(section.body and not section.body[-1])
+    custom_lines, _, list_added, residual = _render_assignment_section(
+        section,
+        custom.section("MITM"),
+        union_keys={"hostname"},
+        case_insensitive_union_keys={"hostname"},
+    )
+    section.body = _compose_custom_first(custom_lines, residual, trailing_blank)
+    stats.list_values_appended += list_added
+
+
+def _rewrite_identity(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith(("#", ";")):
+        return None
+    return stripped.split(None, 1)[0]
+
+
+def _merge_url_rewrite(document: Document, custom: CustomConfig) -> None:
+    section = document.section("URL Rewrite")
+    custom_section = custom.section("URL Rewrite")
+    trailing_blank = bool(section.body and not section.body[-1])
+    custom_ids = {
+        identity
+        for line in custom_section.body
+        if (identity := _rewrite_identity(line)) is not None
+    }
+    custom_comments = _custom_comment_lines(custom_section)
+    seen = set(custom_ids)
+    residual: list[str] = []
     for line in section.body:
-        key = normalize_rule(line)
-        if key is not None and key in seen:
-            stats.removed_lines += 1
-            stats.duplicate_rules_removed += 1
+        identity = _rewrite_identity(line)
+        if identity is not None:
+            if identity in seen:
+                continue
+            seen.add(identity)
+        if line.strip() in custom_comments:
             continue
-        if key is not None:
-            seen.add(key)
-        deduplicated.append(line)
-    section.body = deduplicated
+        residual.append(line)
+    section.body = _compose_custom_first(custom_section.body, residual, trailing_blank)
 
 
-def _ensure_host_section(document: Document, overlay: Overlay, stats: RenderStats) -> Section:
-    matches = [section for section in document.sections if section.name == "Host"]
-    if len(matches) > 1:
-        raise RenderError(f"expected at most one [Host] section, found {len(matches)}")
-    if matches:
-        return matches[0]
-
-    insert_indexes = [
-        index
-        for index, section in enumerate(document.sections)
-        if section.name == overlay.host_insert_before
-    ]
-    if len(insert_indexes) != 1:
-        raise RenderError(
-            f"host insertion anchor [{overlay.host_insert_before}] must occur exactly once"
-        )
-    host = Section(name="Host", body=[""])
-    document.sections.insert(insert_indexes[0], host)
-    stats.sections_added += 1
-    stats.added_lines += 2  # Section header and separating blank line.
-    return host
+def _rule_metrics(
+    lines: Sequence[str], source: str, custom: bool = False
+) -> tuple[int, set[tuple[str, ...] | str]]:
+    identities: set[tuple[str, ...] | str] = set()
+    count = 0
+    for index, line in enumerate(lines, start=1):
+        entry = parse_rule_entry(line, f"{source} line {index}", custom=custom)
+        if entry.kind in {"structured", "opaque", "final"}:
+            assert entry.identity is not None
+            count += 1
+            identities.add(entry.identity)
+    return count, identities
 
 
-def _check_budget(stats: RenderStats, overlay: Overlay) -> None:
+def _merge_rules(document: Document, custom: CustomConfig) -> None:
+    section = document.section("Rule")
+    custom_section = custom.section("Rule")
+    trailing_blank = bool(section.body and not section.body[-1])
+    custom_comments = _custom_comment_lines(custom_section)
+    custom_identities: set[tuple[str, ...]] = set()
+    custom_assignments: set[str] = set()
+    custom_final: str | None = None
+    rendered_custom: list[str] = []
+
+    for index, line in enumerate(custom_section.body, start=1):
+        entry = parse_rule_entry(line, f"custom [Rule] line {index}", custom=True)
+        if entry.kind == "structured":
+            assert isinstance(entry.identity, tuple)
+            custom_identities.add(entry.identity)
+            rendered_custom.append(line)
+        elif entry.kind == "assignment":
+            assert entry.assignment_key is not None
+            custom_assignments.add(entry.assignment_key)
+            rendered_custom.append(line)
+        elif entry.kind == "final":
+            custom_final = line
+        else:
+            rendered_custom.append(line)
+
+    seen_identities = set(custom_identities)
+    seen_opaque: set[str] = set()
+    seen_assignments = set(custom_assignments)
+    upstream_final: str | None = None
+    residual: list[str] = []
+    for index, line in enumerate(section.body, start=1):
+        entry = parse_rule_entry(line, f"upstream [Rule] line {index}")
+        if upstream_final is not None and entry.kind != "trivia":
+            raise RenderError("active Rule entry appears after terminal FINAL")
+        if entry.kind == "trivia":
+            if line.strip() not in custom_comments:
+                residual.append(line)
+            continue
+        if entry.kind == "assignment":
+            assert entry.assignment_key is not None
+            if entry.assignment_key in seen_assignments:
+                continue
+            seen_assignments.add(entry.assignment_key)
+            residual.append(line)
+            continue
+        if entry.kind == "final":
+            if upstream_final is None:
+                upstream_final = line
+            continue
+        if entry.kind == "structured":
+            assert isinstance(entry.identity, tuple)
+            if entry.identity in seen_identities:
+                continue
+            seen_identities.add(entry.identity)
+            residual.append(line)
+            continue
+        assert isinstance(entry.identity, str)
+        if entry.identity in seen_opaque:
+            continue
+        seen_opaque.add(entry.identity)
+        residual.append(line)
+
+    final = custom_final or upstream_final
+    if final is None:
+        raise RenderError("[Rule] must contain a FINAL rule in custom or upstream config")
+    body = _compose_custom_first(rendered_custom, residual, False)
+    body = _trim_blank_edges(body)
+    if body:
+        body.append("")
+    body.append(final)
+    if trailing_blank:
+        body.append("")
+    section.body = body
+
+
+def _line_change_stats(base: bytes, output: bytes) -> tuple[int, int, int]:
+    base_lines = decode_strict_text(base, "input").splitlines()
+    output_lines = decode_strict_text(output, "rendered output").splitlines()
+    added = removed = modified = 0
+    matcher = difflib.SequenceMatcher(a=base_lines, b=output_lines, autojunk=False)
+    for tag, start_a, end_a, start_b, end_b in matcher.get_opcodes():
+        old_count = end_a - start_a
+        new_count = end_b - start_b
+        if tag == "insert":
+            added += new_count
+        elif tag == "delete":
+            removed += old_count
+        elif tag == "replace":
+            overlap = min(old_count, new_count)
+            modified += overlap
+            removed += old_count - overlap
+            added += new_count - overlap
+    return added, removed, modified
+
+
+def _check_budget(stats: RenderStats) -> None:
     checks = {
-        "added lines": (stats.added_lines, overlay.budget["max_added_lines"]),
-        "removed lines": (stats.removed_lines, overlay.budget["max_removed_lines"]),
-        "modified lines": (stats.modified_lines, overlay.budget["max_modified_lines"]),
+        "added lines": (stats.added_lines, MAX_ADDED_LINES),
+        "removed lines": (stats.removed_lines, MAX_REMOVED_LINES),
+        "modified lines": (stats.modified_lines, MAX_MODIFIED_LINES),
         "output byte growth": (
             max(0, stats.output_growth_bytes),
-            overlay.budget["max_output_growth_bytes"],
+            MAX_OUTPUT_GROWTH_BYTES,
         ),
     }
     exceeded = [
@@ -583,70 +697,67 @@ def _check_budget(stats: RenderStats, overlay: Overlay) -> None:
         raise RenderError("change budget exceeded: " + "; ".join(exceeded))
 
 
-def render_bytes(base: bytes, overlay: Overlay) -> RenderResult:
+def render_bytes(base: bytes, custom: CustomConfig) -> RenderResult:
     document = parse_document(base)
-    section_names = {section.name for section in document.sections}
-    missing = [name for name in overlay.core_sections if name not in section_names]
+    missing = [
+        name
+        for name in ("General", "Rule", "URL Rewrite", "MITM")
+        if document.optional_section(name) is None
+    ]
     if missing:
         raise RenderError("missing core sections: " + ", ".join(f"[{name}]" for name in missing))
-
     rule_section = document.section("Rule")
+    base_rule_count, base_rule_identities = _rule_metrics(
+        rule_section.body, "upstream [Rule]"
+    )
+    _, custom_rule_identities = _rule_metrics(
+        custom.section("Rule").body, "custom [Rule]", custom=True
+    )
     stats = RenderStats(
         base_bytes=len(base),
         base_lines=base.count(b"\n"),
-        base_rule_count=sum(
-            normalize_rule(line) is not None for line in rule_section.body
-        ),
+        base_rule_count=base_rule_count,
     )
-    _apply_key_overlay(
-        document.section("General"),
-        overlay.general_ensure,
-        overlay.general_append_unique,
-        stats,
-        count_general_values=True,
-    )
-    host = _ensure_host_section(document, overlay, stats)
-    _apply_key_overlay(host, overlay.host_ensure, {}, stats)
-    _apply_key_overlay(
-        document.section("MITM"),
-        overlay.mitm_ensure,
-        overlay.mitm_append_unique,
-        stats,
-    )
-    _apply_rule_overlay(rule_section, overlay, stats)
-    output_rule_keys = {
-        key for line in rule_section.body if (key := normalize_rule(line)) is not None
-    }
-    stats.output_rule_count = len(
-        [line for line in rule_section.body if normalize_rule(line) is not None]
-    )
-    stats.output_unique_rule_count = len(output_rule_keys)
 
+    _merge_general(document, custom, stats)
+    _merge_rules(document, custom)
+    _merge_host(document, custom, stats)
+    _merge_url_rewrite(document, custom)
+    _merge_mitm(document, custom, stats)
+
+    output_rule_count, output_rule_identities = _rule_metrics(
+        document.section("Rule").body, "rendered [Rule]"
+    )
+    stats.output_rule_count = output_rule_count
+    stats.output_unique_rule_count = len(output_rule_identities)
+    stats.duplicate_rules_removed = max(
+        0,
+        base_rule_count
+        + len(custom_rule_identities - base_rule_identities)
+        - output_rule_count,
+    )
     output = document.serialize()
     decode_strict_text(output, "rendered output")
     stats.output_bytes = len(output)
     stats.output_lines = output.count(b"\n")
     stats.output_growth_bytes = len(output) - len(base)
+    stats.added_lines, stats.removed_lines, stats.modified_lines = _line_change_stats(
+        base, output
+    )
     if stats.output_rule_count != stats.output_unique_rule_count:
         raise RenderError("internal rule uniqueness accounting mismatch")
-    if stats.output_lines != stats.base_lines + stats.added_lines - stats.removed_lines:
-        raise RenderError("internal line accounting mismatch")
-    _check_budget(stats, overlay)
-    return RenderResult(
-        output=output,
-        overlay_sha256=overlay.digest,
-        stats=stats.as_dict(),
-    )
+    _check_budget(stats)
+    return RenderResult(output=output, custom_sha256=custom.digest, stats=stats.as_dict())
 
 
 def build_state(result: RenderResult, base: bytes, upstream_commit: str) -> dict[str, Any]:
     if re.fullmatch(r"[0-9a-f]{40}", upstream_commit) is None:
         raise RenderError("upstream commit must be a lowercase 40-character commit ID")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "upstream_commit": upstream_commit,
         "base_sha256": sha256(base),
-        "overlay_sha256": result.overlay_sha256,
+        "custom_sha256": result.custom_sha256,
         "output_sha256": sha256(result.output),
         "stats": dict(result.stats),
     }
@@ -681,28 +792,39 @@ def render_files(
     input_path: Path,
     output_path: Path,
     state_path: Path,
-    overlay_path: Path,
+    custom_path: Path,
     upstream_commit: str,
 ) -> dict[str, Any]:
     base = read_strict_file(input_path)
-    overlay = load_overlay(overlay_path)
-    result = render_bytes(base, overlay)
+    custom = load_custom_config(custom_path)
+    result = render_bytes(base, custom)
     state = build_state(result, base, upstream_commit)
     _atomic_write(output_path, result.output)
     _atomic_write(state_path, encode_state(state))
     return state
 
 
-def check_files(input_path: Path, output_path: Path, overlay_path: Path) -> RenderResult:
+def check_files(input_path: Path, output_path: Path, custom_path: Path) -> RenderResult:
     base = read_strict_file(input_path)
     actual = read_strict_file(output_path)
-    result = render_bytes(base, load_overlay(overlay_path))
+    result = render_bytes(base, load_custom_config(custom_path))
     if actual != result.output:
         raise RenderError(
             "rendered candidate differs from output: "
             f"expected sha256 {sha256(result.output)}, found {sha256(actual)}"
         )
     return result
+
+
+def _validate_state_stats(stats: object) -> None:
+    expected_stats = set(RenderStats().as_dict())
+    if not isinstance(stats, dict) or set(stats) != expected_stats:
+        raise RenderError("state stats has an invalid key set")
+    for key, value in stats.items():
+        if type(value) is not int:
+            raise RenderError(f"state stats.{key} must be an integer")
+        if key != "output_growth_bytes" and value < 0:
+            raise RenderError(f"state stats.{key} must be non-negative")
 
 
 def _load_state(path: Path) -> Mapping[str, Any]:
@@ -712,45 +834,35 @@ def _load_state(path: Path) -> Mapping[str, Any]:
     except json.JSONDecodeError as error:
         raise RenderError(f"invalid state JSON {path}: {error}") from error
     if not isinstance(state, dict):
-        raise RenderError("state must be a schema_version 1 JSON object")
+        raise RenderError("state must be a schema_version 1 or 2 JSON object")
+    schema = state.get("schema_version")
+    if type(schema) is not int or schema not in {1, 2}:
+        raise RenderError("state schema_version must be integer 1 or 2")
+    config_hash_key = "overlay_sha256" if schema == 1 else "custom_sha256"
     required = {
         "schema_version",
         "upstream_commit",
         "base_sha256",
-        "overlay_sha256",
+        config_hash_key,
         "output_sha256",
         "stats",
     }
     if set(state) != required:
         raise RenderError("state has an invalid top-level key set")
-    if type(state["schema_version"]) is not int or state["schema_version"] != 1:
-        raise RenderError("state schema_version must be integer 1")
     if (
         not isinstance(state["upstream_commit"], str)
         or re.fullmatch(r"[0-9a-f]{40}", state["upstream_commit"]) is None
     ):
         raise RenderError("state upstream_commit must be a lowercase 40-character commit ID")
-    for key in ("base_sha256", "overlay_sha256", "output_sha256"):
+    for key in ("base_sha256", config_hash_key, "output_sha256"):
         value = state[key]
         if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
             raise RenderError(f"state {key} must be a lowercase SHA-256 digest")
-
-    stats = state["stats"]
-    expected_stats = set(RenderStats().as_dict())
-    if not isinstance(stats, dict) or set(stats) != expected_stats:
-        raise RenderError("state stats has an invalid key set")
-    for key, value in stats.items():
-        if type(value) is not int:
-            raise RenderError(f"state stats.{key} must be an integer")
-        if key != "output_growth_bytes" and value < 0:
-            raise RenderError(f"state stats.{key} must be non-negative")
+    _validate_state_stats(state["stats"])
     return state
 
 
-def verify_state_files(
-    output_path: Path,
-    state_path: Path,
-) -> Mapping[str, Any]:
+def verify_state_files(output_path: Path, state_path: Path) -> Mapping[str, Any]:
     actual = read_strict_file(output_path)
     recorded = _load_state(state_path)
     actual_digest = sha256(actual)
@@ -762,130 +874,26 @@ def verify_state_files(
     return recorded
 
 
-def validate_history_records(
-    bootstrap_commit: str,
-    tip_commit: str,
-    commits: Sequence[HistoryCommit],
-    expected_subject: str = EXPECTED_MERGE_SUBJECT,
-) -> HistoryValidation:
-    expected_first_parent = bootstrap_commit
-    for commit in commits:
-        if len(commit.parents) != 2:
-            raise RenderError(
-                f"first-parent commit {commit.oid} must be a two-parent merge; "
-                f"found {len(commit.parents)} parents"
-            )
-        if commit.parents[0] != expected_first_parent:
-            raise RenderError(
-                f"broken first-parent chain at {commit.oid}: expected "
-                f"{expected_first_parent}, found {commit.parents[0]}"
-            )
-        if commit.subject != expected_subject:
-            raise RenderError(
-                f"unexpected merge subject at {commit.oid}: expected "
-                f"{expected_subject!r}, found {commit.subject!r}"
-            )
-        expected_first_parent = commit.oid
-    if expected_first_parent != tip_commit:
-        raise RenderError(
-            f"first-parent history ended at {expected_first_parent}, expected {tip_commit}"
-        )
-    return HistoryValidation(bootstrap_commit, tip_commit, len(commits))
-
-
-def _git(
-    repository: Path, *arguments: str, check: bool = True
-) -> subprocess.CompletedProcess[str]:
-    try:
-        return subprocess.run(
-            ["git", "-C", str(repository), *arguments],
-            check=check,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as error:
-        detail = ""
-        if isinstance(error, subprocess.CalledProcessError):
-            detail = error.stderr.strip()
-        raise RenderError(
-            f"git {' '.join(arguments)} failed" + (f": {detail}" if detail else "")
-        ) from error
-
-
-def validate_bootstrap_history(
-    repository: Path,
-    tip: str,
-    bootstrap: str = BOOTSTRAP_COMMIT,
-) -> HistoryValidation:
-    repository = repository.resolve()
-    bootstrap_oid = _git(
-        repository, "rev-parse", "--verify", f"{bootstrap}^{{commit}}"
-    ).stdout.strip()
-    tip_oid = _git(
-        repository, "rev-parse", "--verify", f"{tip}^{{commit}}"
-    ).stdout.strip()
-    ancestor = _git(
-        repository,
-        "merge-base",
-        "--is-ancestor",
-        bootstrap_oid,
-        tip_oid,
-        check=False,
-    )
-    if ancestor.returncode == 1:
-        raise RenderError(f"bootstrap commit {bootstrap_oid} is not an ancestor of {tip_oid}")
-    if ancestor.returncode != 0:
-        raise RenderError(f"git merge-base --is-ancestor failed: {ancestor.stderr.strip()}")
-
-    history_lines = _git(
-        repository,
-        "log",
-        "--first-parent",
-        "--reverse",
-        "--format=%H%x00%P%x00%s",
-        f"{bootstrap_oid}..{tip_oid}",
-    ).stdout.splitlines()
-    commits = []
-    for line in history_lines:
-        if not line:
-            continue
-        fields = line.split("\0", 2)
-        if len(fields) != 3:
-            raise RenderError(f"cannot parse first-parent history record: {line!r}")
-        oid, raw_parents, subject = fields
-        commits.append(HistoryCommit(oid, tuple(raw_parents.split()), subject))
-    return validate_history_records(bootstrap_oid, tip_oid, commits)
-
-
 def _add_candidate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input", type=Path, required=True, help="upstream config")
     parser.add_argument("--output", type=Path, required=True, help="rendered config")
-    parser.add_argument("--overlay", type=Path, default=DEFAULT_OVERLAY)
+    parser.add_argument(
+        "--custom-config", type=Path, default=DEFAULT_CUSTOM_CONFIG, help="custom config"
+    )
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-
     render_parser = subparsers.add_parser("render", help="render an upstream config")
     _add_candidate_arguments(render_parser)
     render_parser.add_argument("--state", type=Path, required=True, help="render state JSON")
     render_parser.add_argument("--upstream-commit", required=True)
-
     check_parser = subparsers.add_parser("check", help="check committed output bytes")
     _add_candidate_arguments(check_parser)
-
     verify_parser = subparsers.add_parser("verify-state", help="verify output provenance")
     verify_parser.add_argument("--output", type=Path, required=True, help="rendered config")
     verify_parser.add_argument("--state", type=Path, required=True, help="render state JSON")
-
-    history_parser = subparsers.add_parser(
-        "validate-history", help="validate the my-rules bootstrap history"
-    )
-    history_parser.add_argument("--repository", type=Path, default=REPOSITORY_ROOT)
-    history_parser.add_argument("--tip", required=True)
-    history_parser.add_argument("--bootstrap", default=BOOTSTRAP_COMMIT)
     return parser
 
 
@@ -898,22 +906,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 options.input,
                 options.output,
                 options.state,
-                options.overlay,
+                options.custom_config,
                 options.upstream_commit,
             )
         elif options.command == "check":
-            result = check_files(options.input, options.output, options.overlay)
+            result = check_files(options.input, options.output, options.custom_config)
             payload = {
                 "output_sha256": sha256(result.output),
-                "overlay_sha256": result.overlay_sha256,
+                "custom_sha256": result.custom_sha256,
                 "stats": dict(result.stats),
             }
-        elif options.command == "verify-state":
-            payload = verify_state_files(options.output, options.state)
         else:
-            payload = validate_bootstrap_history(
-                options.repository, options.tip, options.bootstrap
-            ).as_dict()
+            payload = verify_state_files(options.output, options.state)
     except RenderError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

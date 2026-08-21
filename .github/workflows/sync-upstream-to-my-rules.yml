@@ -29,7 +29,8 @@ env:
   TARGET_BRANCH: my-rules
   TARGET_FILE: sr_top500_banlist_ad.conf
   STATE_FILE: .my-rules-sync-state.json
-  OVERLAY_FILE: automation/my-rules/sr_top500_banlist_ad/overlay.toml
+  CUSTOM_FILE: automation/my-rules/sr_top500_banlist_ad/custom.conf
+  LEGACY_CUSTOM_FILE: sr_top500_banlist_ad_custom.conf
 
 jobs:
   sync:
@@ -75,15 +76,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ -f "target/${STATE_FILE}" ]]; then
-            python3 control/scripts/render_my_rules.py verify-state \
-              --output "target/${TARGET_FILE}" \
-              --state "target/${STATE_FILE}"
-          else
-            python3 control/scripts/render_my_rules.py validate-history \
-              --repository target \
-              --tip HEAD
+          if [[ ! -f "target/${STATE_FILE}" ]]; then
+            echo "Missing ${STATE_FILE}; refusing to infer target provenance." >&2
+            exit 1
           fi
+
+          python3 control/scripts/render_my_rules.py verify-state \
+            --output "target/${TARGET_FILE}" \
+            --state "target/${STATE_FILE}"
 
       - name: Rebuild my-rules from upstream
         run: |
@@ -93,19 +93,22 @@ jobs:
             --input "upstream/${TARGET_FILE}" \
             --output "target/${TARGET_FILE}" \
             --state "target/${STATE_FILE}" \
-            --overlay "control/${OVERLAY_FILE}" \
+            --custom-config "control/${CUSTOM_FILE}" \
             --upstream-commit "${UPSTREAM_SHA}"
 
           python3 control/scripts/render_my_rules.py check \
             --input "upstream/${TARGET_FILE}" \
             --output "target/${TARGET_FILE}" \
-            --overlay "control/${OVERLAY_FILE}"
+            --custom-config "control/${CUSTOM_FILE}"
 
-          # Reapplying the overlay to its own output must be a byte-for-byte no-op.
+          # Reapplying the custom config to its own output must be a byte-for-byte no-op.
           python3 control/scripts/render_my_rules.py check \
             --input "target/${TARGET_FILE}" \
             --output "target/${TARGET_FILE}" \
-            --overlay "control/${OVERLAY_FILE}"
+            --custom-config "control/${CUSTOM_FILE}"
+
+          # The old file was a full 2024 snapshot, not a custom source.
+          rm -f "target/${LEGACY_CUSTOM_FILE}"
 
       - name: Verify change scope
         run: |
@@ -113,7 +116,7 @@ jobs:
 
           while IFS= read -r path; do
             case "${path}" in
-              "${TARGET_FILE}"|"${STATE_FILE}") ;;
+              "${TARGET_FILE}"|"${STATE_FILE}"|"${LEGACY_CUSTOM_FILE}") ;;
               *)
                 echo "Unexpected target change: ${path}" >&2
                 exit 1
@@ -128,6 +131,9 @@ jobs:
           git -C target config user.name "github-actions[bot]"
           git -C target config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C target add -- "${TARGET_FILE}" "${STATE_FILE}"
+          if git -C target ls-files --error-unmatch "${LEGACY_CUSTOM_FILE}" >/dev/null 2>&1; then
+            git -C target add -u -- "${LEGACY_CUSTOM_FILE}"
+          fi
 
           if git -C target diff --cached --quiet; then
             echo "my-rules already matches upstream ${UPSTREAM_SHA}."
