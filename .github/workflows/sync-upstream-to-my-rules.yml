@@ -107,7 +107,7 @@ jobs:
             --output "target/${TARGET_FILE}" \
             --custom-config "control/${CUSTOM_FILE}"
 
-          # The old file was a full 2024 snapshot, not a custom source.
+          # Remove the legacy full snapshot if it is still present.
           rm -f "target/${LEGACY_CUSTOM_FILE}"
 
       - name: Verify change scope
