@@ -1,25 +1,25 @@
 {
-  "base_sha256": "399b392d7423bca580532cb3a5eafc481e3968722233f1396afea4afb77df5ed",
+  "base_sha256": "17b14f003e9b013e781c24598cbe51df596b2244f3e368e73655e4bced5fad19",
   "custom_sha256": "eeb14a53d649b4891184f0d97c69b7c141915dcb43ee4df0291f15ff807edde5",
-  "output_sha256": "e69f4cf603c051492e019c0af84f62a4391ef7a0a9684eb9ead5bc5eae49675a",
+  "output_sha256": "d45f68457469e7f9a3d83b7351486aa6e1156079738aaaccaf59bdd07bca42c9",
   "schema_version": 2,
   "stats": {
     "added_lines": 36,
-    "base_bytes": 3239299,
-    "base_lines": 85337,
-    "base_rule_count": 85230,
+    "base_bytes": 3251527,
+    "base_lines": 85640,
+    "base_rule_count": 85533,
     "duplicate_rules_removed": 108,
     "general_values_added": 9,
     "list_values_appended": 14,
     "modified_lines": 1,
-    "output_bytes": 3236820,
+    "output_bytes": 3249048,
     "output_growth_bytes": -2479,
-    "output_lines": 85256,
-    "output_rule_count": 85133,
-    "output_unique_rule_count": 85133,
+    "output_lines": 85559,
+    "output_rule_count": 85436,
+    "output_unique_rule_count": 85436,
     "removed_lines": 117,
     "rule_fragments_added": 0,
     "sections_added": 1
   },
-  "upstream_commit": "07f8e840ed20d9eddbdb47fa37d5bdeab9fdd012"
+  "upstream_commit": "23b1595bca78fc8e55358c120b27f916c79538e8"
 }
